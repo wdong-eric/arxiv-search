@@ -34,6 +34,7 @@ DEFAULT_CATEGORIES = [
     "astro-ph.HE",
     "astro-ph.IM",
     "astro-ph.SR",
+    "gr-qc",
 ]
 
 
