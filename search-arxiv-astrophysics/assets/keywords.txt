@@ -1,0 +1,16 @@
+# Keyword profile for search_arxiv_astro.py
+# Format:
+# - One keyword/phrase per line, or comma-separated terms.
+# - Lines starting with # are ignored.
+# - Inline comments after # are allowed.
+
+# Objects / systems
+neutron star, pulsar, magnetar, gravitational waves
+
+# Dynamics / oscillations
+stability, asteroseismology, oscillation modes
+
+# Accretion / high-energy
+accretion disk, magnetically arrested disk
+radiative efficiency, outflows, Bondi mass
+X-ray burst

@@ -1,0 +1,4 @@
+interface:
+  display_name: "ArXiv Astro Search"
+  short_description: "Find astrophysics papers on arXiv from evolving keyword sets."
+  default_prompt: "Search arXiv for astrophysics papers using my current research keywords and summarize the best matches."

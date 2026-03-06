@@ -1,0 +1,25 @@
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+.venv*/
+venv/
+
+# Test/tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS / editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Local run outputs (optional working files)
+*.log
+*.tmp
+
+# Keep template keywords tracked; use this for private local variants
+search-arxiv-astrophysics/assets/keywords.local.txt
