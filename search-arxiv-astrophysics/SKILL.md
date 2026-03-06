@@ -61,6 +61,7 @@ Read [references/keyword-playbook.md](references/keyword-playbook.md) for reusab
   - `--match any|all`
   - `--exclude <term>` (repeatable)
   - `--days <N>` (recency filter after fetch)
+  - `--days-field published|updated|either` (use `updated` to include revised papers)
   - `--max-results <N>`
   - `--sort-by relevance|lastUpdatedDate|submittedDate`
   - `--output markdown|json`
@@ -71,6 +72,8 @@ Read [references/keyword-playbook.md](references/keyword-playbook.md) for reusab
 ## Troubleshooting
 
 - If HTTPS fails with certificate verification errors, retry with `--insecure-tls`.
+- To include recently revised papers (older submission, new text), use:
+  - `--days <N> --days-field updated`
 - To make insecure TLS the default for your shell session:
   - `export ARXIV_INSECURE_TLS=1`
 - To restore strict verification in one run:

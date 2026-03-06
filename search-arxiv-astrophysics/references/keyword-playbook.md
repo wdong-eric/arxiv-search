@@ -27,6 +27,12 @@ export ARXIV_INSECURE_TLS=1
 
 Override it for one command with `--secure-tls`.
 
+To include papers with recently revised text, add:
+
+```bash
+--days 90 --days-field updated
+```
+
 ## Quick Keyword Framework
 
 Collect terms across at least three buckets:

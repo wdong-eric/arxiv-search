@@ -122,7 +122,16 @@ def parse_args() -> argparse.Namespace:
         "--days",
         type=int,
         default=None,
-        help="Keep only papers published in the last N days.",
+        help="Keep only papers within the last N days (field set by --days-field).",
+    )
+    parser.add_argument(
+        "--days-field",
+        choices=["published", "updated", "either"],
+        default="published",
+        help=(
+            "When --days is set, filter by original submission date (published), "
+            "latest revision date (updated), or either."
+        ),
     )
     parser.add_argument(
         "--no-keyword-rank",
@@ -344,7 +353,9 @@ def extract_pdf_url(entry: ET.Element, ns: dict[str, str]) -> str | None:
     return None
 
 
-def parse_feed(xml_bytes: bytes, keywords: list[str], days: int | None) -> list[dict]:
+def parse_feed(
+    xml_bytes: bytes, keywords: list[str], days: int | None, days_field: str
+) -> list[dict]:
     ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
     try:
         root = ET.fromstring(xml_bytes)
@@ -368,8 +379,16 @@ def parse_feed(xml_bytes: bytes, keywords: list[str], days: int | None) -> list[
         if not published_raw:
             continue
         published_dt = parse_datetime(published_raw)
-        if cutoff is not None and published_dt < cutoff:
-            continue
+        updated_dt = parse_datetime(updated_raw) if updated_raw else published_dt
+        if cutoff is not None:
+            if days_field == "published":
+                keep = published_dt >= cutoff
+            elif days_field == "updated":
+                keep = updated_dt >= cutoff
+            else:  # either
+                keep = published_dt >= cutoff or updated_dt >= cutoff
+            if not keep:
+                continue
 
         authors = [
             normalize_whitespace(name.text or "")
@@ -381,13 +400,18 @@ def parse_feed(xml_bytes: bytes, keywords: list[str], days: int | None) -> list[
         pdf_url = extract_pdf_url(entry, ns)
 
         score, matched_keywords = keyword_match_info(f"{title} {summary}", keywords)
+        ranking_dt = published_dt
+        if days_field == "updated":
+            ranking_dt = updated_dt
+        elif days_field == "either":
+            ranking_dt = max(published_dt, updated_dt)
         parsed.append(
             {
                 "id": paper_id,
                 "title": title,
                 "summary": summary,
                 "published": published_dt.date().isoformat(),
-                "updated": parse_datetime(updated_raw).date().isoformat() if updated_raw else "",
+                "updated": updated_dt.date().isoformat(),
                 "authors": authors,
                 "categories": categories,
                 "primary_category": primary_category,
@@ -395,6 +419,7 @@ def parse_feed(xml_bytes: bytes, keywords: list[str], days: int | None) -> list[
                 "keyword_score": score,
                 "matched_keywords": matched_keywords,
                 "_published_dt": published_dt,
+                "_ranking_dt": ranking_dt,
             }
         )
 
@@ -433,6 +458,7 @@ def prepare_output(entries: list[dict], output_format: str) -> str:
         for item in entries:
             row = dict(item)
             row.pop("_published_dt", None)
+            row.pop("_ranking_dt", None)
             cleaned.append(row)
         return json.dumps(cleaned, indent=2)
     return render_markdown(entries)
@@ -456,15 +482,17 @@ def main() -> int:
         return 0
 
     feed = fetch_feed(url, timeout=args.timeout, insecure_tls=args.insecure_tls)
-    entries = parse_feed(feed, keywords=args.keyword, days=args.days)
+    entries = parse_feed(
+        feed, keywords=args.keyword, days=args.days, days_field=args.days_field
+    )
 
     if not args.no_keyword_rank:
         entries.sort(
-            key=lambda row: (row["keyword_score"], row["_published_dt"]),
+            key=lambda row: (row["keyword_score"], row["_ranking_dt"]),
             reverse=True,
         )
     else:
-        entries.sort(key=lambda row: row["_published_dt"], reverse=True)
+        entries.sort(key=lambda row: row["_ranking_dt"], reverse=True)
 
     rendered = prepare_output(entries, args.output)
     print(rendered)
