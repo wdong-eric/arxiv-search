@@ -19,6 +19,14 @@ File parsing rules:
 - `#` comments are ignored
 - Duplicate keywords are deduplicated case-insensitively
 
+If your Python TLS certificates are broken, set once per shell:
+
+```bash
+export ARXIV_INSECURE_TLS=1
+```
+
+Override it for one command with `--secure-tls`.
+
 ## Quick Keyword Framework
 
 Collect terms across at least three buckets:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import ssl
 from pathlib import Path
@@ -36,7 +37,23 @@ DEFAULT_CATEGORIES = [
 ]
 
 
+def parse_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(
+        f"Invalid value for {name}: {raw!r}. "
+        "Use one of: 1,true,yes,on,0,false,no,off."
+    )
+
+
 def parse_args() -> argparse.Namespace:
+    insecure_tls_default = parse_env_bool("ARXIV_INSECURE_TLS", default=False)
     parser = argparse.ArgumentParser(
         description="Search arXiv astrophysics papers from keywords."
     )
@@ -128,13 +145,22 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TIMEOUT,
         help=f"HTTP timeout in seconds. Default: {DEFAULT_TIMEOUT}.",
     )
-    parser.add_argument(
+    tls_group = parser.add_mutually_exclusive_group()
+    tls_group.add_argument(
         "--insecure-tls",
         action="store_true",
+        default=insecure_tls_default,
         help=(
             "Disable TLS certificate verification for HTTPS requests. "
-            "Use only when local cert trust is broken."
+            "Use only when local cert trust is broken. "
+            "Defaults from ARXIV_INSECURE_TLS."
         ),
+    )
+    tls_group.add_argument(
+        "--secure-tls",
+        dest="insecure_tls",
+        action="store_false",
+        help="Force TLS certificate verification even if ARXIV_INSECURE_TLS is enabled.",
     )
     parser.add_argument(
         "--dry-run",

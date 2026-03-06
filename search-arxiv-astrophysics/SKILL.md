@@ -65,11 +65,16 @@ Read [references/keyword-playbook.md](references/keyword-playbook.md) for reusab
   - `--sort-by relevance|lastUpdatedDate|submittedDate`
   - `--output markdown|json`
   - `--insecure-tls` (use only if local cert trust is broken)
+  - `--secure-tls` (override env default and force verification)
   - `--dry-run` (print API URL without fetching)
 
 ## Troubleshooting
 
 - If HTTPS fails with certificate verification errors, retry with `--insecure-tls`.
+- To make insecure TLS the default for your shell session:
+  - `export ARXIV_INSECURE_TLS=1`
+- To restore strict verification in one run:
+  - add `--secure-tls`
 - If the query is too broad, move generic terms to `--exclude` or split into batch runs.
 
 ## Output Standard
