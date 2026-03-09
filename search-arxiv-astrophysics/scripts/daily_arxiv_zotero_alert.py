@@ -1,0 +1,1176 @@
+#!/usr/bin/env python3
+"""
+Build and optionally email a daily arXiv digest filtered against a Zotero library.
+
+The digest contains:
+1) recent papers not already in Zotero
+2) older "classic" papers not already in Zotero, ranked by semantic relevance
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import smtplib
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from pathlib import Path
+from typing import Iterable
+
+from search_arxiv_astro import (
+    ARXIV_API_URL,
+    DEFAULT_CATEGORIES,
+    clean_term,
+    fetch_feed,
+    parse_feed,
+    resolve_keywords,
+)
+from semantic_profile import (
+    DEFAULT_EMBEDDING_BATCH_SIZE,
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_KEYWORD_WEIGHT,
+    DEFAULT_PREPROCESS_VERSION,
+    DEFAULT_SEMANTIC_WEIGHT,
+    EmbeddingClient,
+    SemanticCache,
+    SemanticRecord,
+    cosine_similarity,
+    mean_vector,
+)
+
+DEFAULT_TIMEOUT = 20
+STATE_RETENTION_DAYS = 120
+ARXIV_ID_RE = re.compile(
+    r"(?i)(?:arxiv:|https?://arxiv\.org/(?:abs|pdf)/)"
+    r"([a-z\-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?"
+)
+ARXIV_ID_BARE_RE = re.compile(r"(?i)\b([a-z\-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?\b")
+ZOTERO_API_URL_TMPL = "https://api.zotero.org/users/{user_id}/items"
+SEMANTIC_SCHOLAR_TMPL = (
+    "https://api.semanticscholar.org/graph/v1/paper/ARXIV:{paper_id}"
+    "?fields=citationCount"
+)
+
+
+@dataclass
+class ZoteroEmbeddingRecord:
+    item_key: str
+    title: str
+    abstract: str
+
+
+@dataclass
+class ZoteroIndex:
+    arxiv_ids: set[str]
+    dois: set[str]
+    titles: set[str]
+    embedding_records: list[ZoteroEmbeddingRecord]
+
+
+@dataclass
+class SemanticRunMetadata:
+    ranking_mode: str
+    warning_message: str | None
+    zotero_embedded_new: int
+    zotero_cached_reused: int
+    arxiv_embedded_new: int
+    arxiv_cached_reused: int
+
+
+def parse_args() -> argparse.Namespace:
+    base_dir = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(
+        description="Generate a daily arXiv alert filtered by Zotero holdings."
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=base_dir / ".env",
+        help="Optional KEY=VALUE config file. Default: search-arxiv-astrophysics/.env",
+    )
+    parser.add_argument(
+        "--keywords-file",
+        type=Path,
+        default=None,
+        help=(
+            "Keyword file used for keyword scoring/fallback ranking. "
+            "Defaults from env or assets/keywords.txt."
+        ),
+    )
+    parser.add_argument(
+        "--match",
+        choices=["any", "all"],
+        default=None,
+        help="Deprecated and ignored. Retrieval is category-only in v1.",
+    )
+    parser.add_argument(
+        "--category",
+        action="append",
+        help="arXiv category filter (repeatable). Defaults to astrophysics set.",
+    )
+    parser.add_argument(
+        "--semantic",
+        choices=["auto", "on", "off"],
+        default=None,
+        help=(
+            "Semantic ranking mode. auto: use semantic when available, else fallback. "
+            "on: attempt semantic then fallback with warning if unavailable. "
+            "off: always keyword ranking."
+        ),
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        default=None,
+        help="OpenAI API key for embeddings. Defaults from env OPENAI_API_KEY.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help=f"Embedding model. Defaults from env or {DEFAULT_EMBEDDING_MODEL}.",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Embedding API batch size. "
+            f"Defaults from env or {DEFAULT_EMBEDDING_BATCH_SIZE}."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-weight",
+        type=float,
+        default=None,
+        help=(
+            "Weight for semantic similarity in final score. "
+            f"Defaults from env or {DEFAULT_SEMANTIC_WEIGHT}."
+        ),
+    )
+    parser.add_argument(
+        "--keyword-weight",
+        type=float,
+        default=None,
+        help=(
+            "Weight for keyword score in final score. "
+            f"Defaults from env or {DEFAULT_KEYWORD_WEIGHT}."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-cache-path",
+        type=Path,
+        default=None,
+        help="Path to semantic embedding cache sqlite file.",
+    )
+    parser.add_argument(
+        "--rebuild-embeddings",
+        action="store_true",
+        help="Force full semantic embedding cache rebuild.",
+    )
+    parser.add_argument(
+        "--new-days",
+        type=int,
+        default=1,
+        help="How many days to consider for 'new papers'. Default: 1.",
+    )
+    parser.add_argument(
+        "--new-max-results",
+        type=int,
+        default=120,
+        help="arXiv fetch size for new-paper search. Default: 120.",
+    )
+    parser.add_argument(
+        "--new-top-n",
+        type=int,
+        default=12,
+        help="Max new papers included in digest. Default: 12.",
+    )
+    parser.add_argument(
+        "--classic-max-results",
+        type=int,
+        default=120,
+        help="arXiv fetch size for classic-paper candidates. Default: 120.",
+    )
+    parser.add_argument(
+        "--classic-min-age-years",
+        type=int,
+        default=8,
+        help="Minimum age for classic papers. Default: 8 years.",
+    )
+    parser.add_argument(
+        "--classic-lookup-limit",
+        type=int,
+        default=30,
+        help="Max classic candidates for citation lookup. Default: 30.",
+    )
+    parser.add_argument(
+        "--classic-top-n",
+        type=int,
+        default=8,
+        help="Max classics included in digest. Default: 8.",
+    )
+    parser.add_argument(
+        "--zotero-user-id",
+        default=None,
+        help="Zotero user id. Defaults from env.",
+    )
+    parser.add_argument(
+        "--zotero-api-key",
+        default=None,
+        help="Read-only Zotero API key. Defaults from env.",
+    )
+    parser.add_argument(
+        "--zotero-max-items",
+        type=int,
+        default=2500,
+        help="Max Zotero items to index. Default: 2500.",
+    )
+    parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=base_dir / "assets/daily_alert_state.json",
+        help="Local state file to avoid repeat alerts across runs.",
+    )
+    parser.add_argument(
+        "--report-file",
+        type=Path,
+        default=base_dir / "assets/daily_alert_latest.md",
+        help="Path to write latest digest report.",
+    )
+    parser.add_argument(
+        "--smtp-host",
+        default=None,
+        help="SMTP host. Defaults from env.",
+    )
+    parser.add_argument(
+        "--smtp-port",
+        type=int,
+        default=None,
+        help="SMTP port. Defaults from env or 587.",
+    )
+    parser.add_argument(
+        "--smtp-user",
+        default=None,
+        help="SMTP username. Defaults from env.",
+    )
+    parser.add_argument(
+        "--smtp-password",
+        default=None,
+        help="SMTP password/app token. Defaults from env.",
+    )
+    parser.add_argument(
+        "--smtp-from",
+        default=None,
+        help="From email address. Defaults from env.",
+    )
+    parser.add_argument(
+        "--smtp-to",
+        default=None,
+        help="Comma-separated recipient list. Defaults from env.",
+    )
+    parser.add_argument(
+        "--smtp-use-ssl",
+        action="store_true",
+        help="Use SMTP SSL directly (usually port 465).",
+    )
+    parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Do not send email; only print and save digest.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=f"HTTP timeout in seconds. Default: {DEFAULT_TIMEOUT}.",
+    )
+    parser.add_argument(
+        "--insecure-tls",
+        action="store_true",
+        help="Disable TLS certificate verification for HTTPS requests.",
+    )
+    return parser.parse_args()
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def first_non_empty(*values: str | None) -> str | None:
+    for value in values:
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def parse_env_bool(raw_value: str | None, default: bool = False) -> bool:
+    if raw_value is None:
+        return default
+    value = raw_value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+def parse_env_float(raw_value: str | None, default: float) -> float:
+    if raw_value is None or not str(raw_value).strip():
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
+def parse_env_int(raw_value: str | None, default: int) -> int:
+    if raw_value is None or not str(raw_value).strip():
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
+def today_local_iso() -> str:
+    return datetime.now().astimezone().date().isoformat()
+
+
+def normalize_doi(value: str) -> str:
+    doi = value.strip().lower()
+    doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
+    return doi
+
+
+def normalize_title(value: str) -> str:
+    value = value.casefold()
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(r"[^a-z0-9 ]+", "", value)
+    return value.strip()
+
+
+def canonical_arxiv_id(value: str) -> str | None:
+    text = value.strip()
+    if not text:
+        return None
+    match = ARXIV_ID_RE.search(text)
+    if not match:
+        match = ARXIV_ID_BARE_RE.search(text)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def safe_json_get(
+    url: str,
+    headers: dict[str, str] | None,
+    timeout: int,
+    insecure_tls: bool = False,
+) -> list | dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "codex-arxiv-zotero-alert/1.0",
+            **(headers or {}),
+        },
+    )
+    context = ssl._create_unverified_context() if insecure_tls else None
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_zotero_index(
+    user_id: str,
+    api_key: str,
+    max_items: int,
+    timeout: int,
+    insecure_tls: bool = False,
+) -> ZoteroIndex:
+    arxiv_ids: set[str] = set()
+    dois: set[str] = set()
+    titles: set[str] = set()
+    embedding_records: list[ZoteroEmbeddingRecord] = []
+    limit = 100
+    fetched = 0
+
+    while fetched < max_items:
+        batch_limit = min(limit, max_items - fetched)
+        params = urllib.parse.urlencode(
+            {"format": "json", "start": fetched, "limit": batch_limit}
+        )
+        url = f"{ZOTERO_API_URL_TMPL.format(user_id=user_id)}?{params}"
+        payload = safe_json_get(
+            url,
+            headers={"Zotero-API-Key": api_key},
+            timeout=timeout,
+            insecure_tls=insecure_tls,
+        )
+        if not isinstance(payload, list) or not payload:
+            break
+
+        for item in payload:
+            data = item.get("data", {})
+            title_raw = str(data.get("title", "") or "")
+            abstract_raw = str(data.get("abstractNote", "") or "")
+
+            title = normalize_title(title_raw)
+            if title:
+                titles.add(title)
+
+            doi = normalize_doi(data.get("DOI", ""))
+            if doi:
+                dois.add(doi)
+
+            for field in ("url", "archiveLocation", "extra"):
+                arxiv_id = canonical_arxiv_id(str(data.get(field, "")))
+                if arxiv_id:
+                    arxiv_ids.add(arxiv_id)
+
+            note = data.get("extra", "")
+            if note:
+                for token in re.split(r"[\s,;|]+", str(note)):
+                    arxiv_id = canonical_arxiv_id(token)
+                    if arxiv_id:
+                        arxiv_ids.add(arxiv_id)
+
+            item_key = str(item.get("key", "") or "").strip()
+            if item_key and (title_raw.strip() or abstract_raw.strip()):
+                embedding_records.append(
+                    ZoteroEmbeddingRecord(
+                        item_key=item_key,
+                        title=title_raw,
+                        abstract=abstract_raw,
+                    )
+                )
+
+        fetched += len(payload)
+        if len(payload) < batch_limit:
+            break
+
+    return ZoteroIndex(
+        arxiv_ids=arxiv_ids,
+        dois=dois,
+        titles=titles,
+        embedding_records=embedding_records,
+    )
+
+
+def build_category_query(categories: list[str]) -> str:
+    category_terms = [f"cat:{clean_term(c)}" for c in categories if clean_term(c)]
+    if not category_terms:
+        raise ValueError("At least one category must be provided.")
+    if len(category_terms) == 1:
+        return category_terms[0]
+    return f"({' OR '.join(category_terms)})"
+
+
+def build_arxiv_url(
+    categories: list[str],
+    max_results: int,
+    sort_by: str,
+    sort_order: str = "descending",
+) -> str:
+    query = build_category_query(categories)
+    params = urllib.parse.urlencode(
+        {
+            "search_query": query,
+            "start": 0,
+            "max_results": max_results,
+            "sortBy": sort_by,
+            "sortOrder": sort_order,
+        }
+    )
+    return f"{ARXIV_API_URL}?{params}"
+
+
+def fetch_arxiv_entries(
+    *,
+    keywords: list[str],
+    categories: list[str],
+    max_results: int,
+    sort_by: str,
+    sort_order: str,
+    days: int | None,
+    timeout: int,
+    insecure_tls: bool,
+) -> list[dict]:
+    url = build_arxiv_url(
+        categories=categories,
+        max_results=max_results,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+    feed = fetch_feed(url, timeout=timeout, insecure_tls=insecure_tls)
+    entries = parse_feed(
+        feed,
+        keywords=keywords,
+        days=days,
+        days_field="published",
+    )
+    entries.sort(
+        key=lambda row: row["_ranking_dt"],
+        reverse=(sort_order == "descending"),
+    )
+    return entries
+
+
+def is_known_in_zotero(entry: dict, zotero: ZoteroIndex) -> bool:
+    arxiv_id = canonical_arxiv_id(entry.get("id", ""))
+    if arxiv_id and arxiv_id in zotero.arxiv_ids:
+        return True
+    title = normalize_title(entry.get("title", ""))
+    if title and title in zotero.titles:
+        return True
+    return False
+
+
+def load_state(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for key, value in payload.items():
+        if isinstance(key, str) and isinstance(value, str):
+            cleaned[key] = value
+    return cleaned
+
+
+def save_state(path: Path, state: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def prune_state(state: dict[str, str], retention_days: int) -> dict[str, str]:
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=retention_days)
+    keep: dict[str, str] = {}
+    for paper_id, sent_date in state.items():
+        try:
+            date_value = datetime.fromisoformat(sent_date).date()
+        except ValueError:
+            continue
+        if date_value >= cutoff:
+            keep[paper_id] = sent_date
+    return keep
+
+
+def fetch_citation_count(
+    arxiv_id: str,
+    timeout: int,
+    insecure_tls: bool = False,
+) -> int | None:
+    url = SEMANTIC_SCHOLAR_TMPL.format(paper_id=urllib.parse.quote(arxiv_id, safe=""))
+    try:
+        payload = safe_json_get(
+            url,
+            headers=None,
+            timeout=timeout,
+            insecure_tls=insecure_tls,
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code in {404, 429}:
+            return None
+        raise
+    except urllib.error.URLError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("citationCount")
+    return int(raw) if isinstance(raw, int) else None
+
+
+def score_classics(
+    entries: list[dict],
+    *,
+    min_age_years: int,
+    lookup_limit: int,
+    timeout: int,
+    insecure_tls: bool,
+) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    eligible: list[dict] = []
+    for entry in entries:
+        age_years = (now - entry["_published_dt"]).days / 365.25
+        if age_years < min_age_years:
+            continue
+        row = dict(entry)
+        row["age_years"] = round(age_years, 1)
+        row["citation_count"] = None
+        eligible.append(row)
+
+    for row in eligible[:lookup_limit]:
+        paper_id = canonical_arxiv_id(row.get("id", ""))
+        if not paper_id:
+            continue
+        row["citation_count"] = fetch_citation_count(
+            paper_id, timeout=timeout, insecure_tls=insecure_tls
+        )
+
+    return eligible
+
+
+def entry_cache_id(entry: dict) -> str:
+    return canonical_arxiv_id(entry.get("id", "")) or str(entry.get("id", "")).strip()
+
+
+def normalize_weights(semantic_weight: float, keyword_weight: float) -> tuple[float, float]:
+    if semantic_weight < 0 or keyword_weight < 0:
+        raise ValueError("SEMANTIC_WEIGHT and KEYWORD_WEIGHT must be non-negative.")
+    total = semantic_weight + keyword_weight
+    if total <= 0:
+        raise ValueError("SEMANTIC_WEIGHT + KEYWORD_WEIGHT must be greater than zero.")
+    return semantic_weight / total, keyword_weight / total
+
+
+def attach_keyword_score_norm(entries: list[dict]) -> None:
+    max_keyword = max((int(entry.get("keyword_score", 0)) for entry in entries), default=0)
+    for entry in entries:
+        keyword_score = float(entry.get("keyword_score", 0))
+        keyword_norm = keyword_score / max_keyword if max_keyword > 0 else 0.0
+        entry["keyword_score_norm"] = keyword_norm
+
+
+def apply_semantic_scores(
+    entries: list[dict],
+    *,
+    profile_vector: list[float],
+    candidate_vectors: dict[str, list[float]],
+    semantic_weight: float,
+    keyword_weight: float,
+) -> None:
+    attach_keyword_score_norm(entries)
+    for entry in entries:
+        semantic_score = 0.0
+        candidate_vector = candidate_vectors.get(entry_cache_id(entry))
+        if candidate_vector is not None:
+            semantic_score = cosine_similarity(profile_vector, candidate_vector)
+        entry["semantic_score"] = semantic_score
+        entry["final_score"] = (
+            semantic_weight * semantic_score
+            + keyword_weight * float(entry.get("keyword_score_norm", 0.0))
+        )
+
+
+def apply_keyword_only_scores(entries: list[dict]) -> None:
+    attach_keyword_score_norm(entries)
+    for entry in entries:
+        entry["semantic_score"] = None
+        entry["final_score"] = float(entry.get("keyword_score_norm", 0.0))
+
+
+def sort_new_entries(entries: list[dict], semantic_available: bool) -> None:
+    if semantic_available:
+        entries.sort(
+            key=lambda row: (
+                float(row.get("final_score", 0.0)),
+                row.get("_ranking_dt"),
+            ),
+            reverse=True,
+        )
+        return
+    entries.sort(
+        key=lambda row: (
+            int(row.get("keyword_score", 0)),
+            row.get("_ranking_dt"),
+        ),
+        reverse=True,
+    )
+
+
+def sort_classic_entries(entries: list[dict], semantic_available: bool) -> None:
+    if semantic_available:
+        entries.sort(
+            key=lambda row: (
+                float(row.get("final_score", 0.0)),
+                -1 if row.get("citation_count") is None else row.get("citation_count", -1),
+                int(row.get("keyword_score", 0)),
+            ),
+            reverse=True,
+        )
+        return
+
+    entries.sort(
+        key=lambda row: (
+            int(row.get("keyword_score", 0)),
+            -1 if row.get("citation_count") is None else row.get("citation_count", -1),
+            row.get("_ranking_dt"),
+        ),
+        reverse=True,
+    )
+
+
+def build_candidate_semantic_records(entries: Iterable[dict]) -> list[SemanticRecord]:
+    records: dict[str, SemanticRecord] = {}
+    for entry in entries:
+        record_id = entry_cache_id(entry)
+        if not record_id:
+            continue
+        if record_id in records:
+            continue
+        records[record_id] = SemanticRecord(
+            record_id=record_id,
+            title=str(entry.get("title", "")),
+            abstract=str(entry.get("summary", "")),
+        )
+    return list(records.values())
+
+
+def format_lines(entries: Iterable[dict], include_citations: bool = False) -> list[str]:
+    lines: list[str] = []
+    for idx, entry in enumerate(entries, start=1):
+        matched = ", ".join(entry.get("matched_keywords", [])) or "n/a"
+        lines.append(f"{idx}. {entry.get('title', '').strip()}")
+        lines.append(f"   - arXiv: {entry.get('id', '')}")
+        lines.append(f"   - Published: {entry.get('published', '')}")
+        if entry.get("primary_category"):
+            lines.append(f"   - Category: {entry['primary_category']}")
+        lines.append(
+            "   - Keyword score: "
+            f"{entry.get('keyword_score', 0)} "
+            f"(norm={float(entry.get('keyword_score_norm', 0.0)):.4f})"
+        )
+        if entry.get("semantic_score") is not None:
+            lines.append(f"   - Semantic score: {float(entry.get('semantic_score', 0.0)):.4f}")
+        lines.append(f"   - Final score: {float(entry.get('final_score', 0.0)):.4f}")
+        lines.append(f"   - Matched keywords: {matched}")
+        if include_citations:
+            citation = entry.get("citation_count")
+            age = entry.get("age_years")
+            citation_text = "unavailable" if citation is None else str(citation)
+            lines.append(f"   - Citations: {citation_text}")
+            lines.append(f"   - Approx age (years): {age}")
+        lines.append("")
+    return lines
+
+
+def build_digest(
+    *,
+    new_entries: list[dict],
+    classic_entries: list[dict],
+    categories: list[str],
+    keywords_file: Path,
+    new_days: int,
+    semantic_metadata: SemanticRunMetadata,
+) -> str:
+    today = today_local_iso()
+    lines = [
+        f"# arXiv Daily Digest ({today})",
+        "",
+        "## Scope",
+        f"- Categories: {', '.join(categories)}",
+        f"- Keyword file: {keywords_file}",
+        f"- New-paper window: last {new_days} day(s)",
+        f"- Ranking mode: {semantic_metadata.ranking_mode}",
+        (
+            "- Semantic cache updates: "
+            f"zotero(new={semantic_metadata.zotero_embedded_new}, "
+            f"reused={semantic_metadata.zotero_cached_reused}), "
+            f"arxiv(new={semantic_metadata.arxiv_embedded_new}, "
+            f"reused={semantic_metadata.arxiv_cached_reused})"
+        ),
+        "",
+    ]
+    if semantic_metadata.warning_message:
+        lines.append(f"- Warning: {semantic_metadata.warning_message}")
+        lines.append("")
+
+    lines.append("## New Papers Not In Zotero")
+    if new_entries:
+        lines.extend(format_lines(new_entries, include_citations=False))
+    else:
+        lines.append("No new unknown papers found today.")
+        lines.append("")
+
+    lines.append("## Classic Papers You Likely Don't Have")
+    if classic_entries:
+        lines.extend(format_lines(classic_entries, include_citations=True))
+    else:
+        lines.append("No classic unknown papers found in this run.")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def send_email(
+    *,
+    smtp_host: str,
+    smtp_port: int,
+    smtp_user: str | None,
+    smtp_password: str | None,
+    smtp_from: str,
+    smtp_to: list[str],
+    smtp_use_ssl: bool,
+    subject: str,
+    body: str,
+) -> None:
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = smtp_from
+    message["To"] = ", ".join(smtp_to)
+    message.set_content(body)
+
+    if smtp_use_ssl:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+            if smtp_user:
+                server.login(smtp_user, smtp_password or "")
+            server.send_message(message)
+        return
+
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        if smtp_user:
+            server.login(smtp_user, smtp_password or "")
+        server.send_message(message)
+
+
+def main() -> int:
+    args = parse_args()
+    base_dir = Path(__file__).resolve().parents[1]
+    env_values = parse_env_file(args.env_file)
+
+    categories_env = first_non_empty(env_values.get("ARXIV_CATEGORIES"), None)
+    categories = args.category or []
+    if not categories and categories_env:
+        categories = [clean_term(c) for c in categories_env.split(",") if clean_term(c)]
+    if not categories:
+        categories = list(DEFAULT_CATEGORIES)
+
+    if args.match is not None:
+        print("Warning: --match is deprecated and ignored. Retrieval is category-only.")
+    env_match = first_non_empty(env_values.get("ARXIV_MATCH"), None)
+    if env_match and env_match.lower() not in {"", "any"}:
+        print(
+            "Warning: ARXIV_MATCH is deprecated and ignored. "
+            "Retrieval is category-only."
+        )
+
+    keywords_raw = first_non_empty(
+        str(args.keywords_file) if args.keywords_file else None,
+        env_values.get("ARXIV_KEYWORDS_FILE"),
+        str(base_dir / "assets/keywords.txt"),
+    )
+    keywords_path = Path(keywords_raw or str(base_dir / "assets/keywords.txt"))
+    if not keywords_path.is_absolute():
+        keywords_path = (base_dir / keywords_path).resolve()
+
+    keywords = resolve_keywords(inline_keywords=None, keywords_file=str(keywords_path))
+    if not keywords:
+        raise ValueError(f"No keywords found in {keywords_path}.")
+
+    semantic_mode = (
+        first_non_empty(args.semantic, env_values.get("SEMANTIC_MODE"), "auto") or "auto"
+    )
+    if semantic_mode not in {"auto", "on", "off"}:
+        raise ValueError("SEMANTIC_MODE must be one of auto|on|off.")
+
+    semantic_cache_path_raw = first_non_empty(
+        str(args.semantic_cache_path) if args.semantic_cache_path else None,
+        env_values.get("SEMANTIC_CACHE_PATH"),
+        str(base_dir / "assets/semantic_cache.sqlite"),
+    )
+    semantic_cache_path = Path(
+        semantic_cache_path_raw or str(base_dir / "assets/semantic_cache.sqlite")
+    )
+    if not semantic_cache_path.is_absolute():
+        semantic_cache_path = (base_dir / semantic_cache_path).resolve()
+
+    embedding_model = (
+        first_non_empty(
+            args.embedding_model,
+            env_values.get("EMBEDDING_MODEL"),
+            DEFAULT_EMBEDDING_MODEL,
+        )
+        or DEFAULT_EMBEDDING_MODEL
+    )
+    embedding_batch_size = (
+        args.embedding_batch_size
+        if args.embedding_batch_size is not None
+        else parse_env_int(
+            env_values.get("EMBEDDING_BATCH_SIZE"),
+            DEFAULT_EMBEDDING_BATCH_SIZE,
+        )
+    )
+    if embedding_batch_size < 1:
+        raise ValueError("--embedding-batch-size must be at least 1.")
+
+    semantic_weight_raw = (
+        args.semantic_weight
+        if args.semantic_weight is not None
+        else parse_env_float(
+            env_values.get("SEMANTIC_WEIGHT"),
+            DEFAULT_SEMANTIC_WEIGHT,
+        )
+    )
+    keyword_weight_raw = (
+        args.keyword_weight
+        if args.keyword_weight is not None
+        else parse_env_float(
+            env_values.get("KEYWORD_WEIGHT"),
+            DEFAULT_KEYWORD_WEIGHT,
+        )
+    )
+    semantic_weight, keyword_weight = normalize_weights(
+        semantic_weight_raw,
+        keyword_weight_raw,
+    )
+
+    openai_api_key = first_non_empty(
+        args.openai_api_key,
+        env_values.get("OPENAI_API_KEY"),
+    )
+
+    zotero_user_id = first_non_empty(args.zotero_user_id, env_values.get("ZOTERO_USER_ID"))
+    zotero_api_key = first_non_empty(args.zotero_api_key, env_values.get("ZOTERO_API_KEY"))
+    if not zotero_user_id or not zotero_api_key:
+        raise ValueError(
+            "Missing Zotero credentials. Provide ZOTERO_USER_ID and ZOTERO_API_KEY "
+            "via --env-file or command flags."
+        )
+
+    preview_only = args.preview_only or parse_env_bool(
+        env_values.get("ALERT_PREVIEW_ONLY"), default=False
+    )
+    smtp_host = first_non_empty(args.smtp_host, env_values.get("SMTP_HOST"))
+    smtp_port = args.smtp_port or int(first_non_empty(env_values.get("SMTP_PORT"), "587") or "587")
+    smtp_user = first_non_empty(args.smtp_user, env_values.get("SMTP_USER"))
+    smtp_password = first_non_empty(args.smtp_password, env_values.get("SMTP_PASSWORD"))
+    smtp_from = first_non_empty(args.smtp_from, env_values.get("SMTP_FROM"))
+    smtp_to_raw = first_non_empty(
+        args.smtp_to,
+        env_values.get("SMTP_TO"),
+        env_values.get("ALERT_EMAIL_TO"),
+    )
+    smtp_to = [addr.strip() for addr in (smtp_to_raw or "").split(",") if addr.strip()]
+    smtp_use_ssl = args.smtp_use_ssl or parse_env_bool(
+        env_values.get("SMTP_USE_SSL"), default=False
+    )
+
+    zotero = fetch_zotero_index(
+        user_id=zotero_user_id,
+        api_key=zotero_api_key,
+        max_items=args.zotero_max_items,
+        timeout=args.timeout,
+        insecure_tls=args.insecure_tls,
+    )
+
+    state = prune_state(load_state(args.state_file), STATE_RETENTION_DAYS)
+
+    new_candidates = fetch_arxiv_entries(
+        keywords=keywords,
+        categories=categories,
+        max_results=args.new_max_results,
+        sort_by="submittedDate",
+        sort_order="descending",
+        days=args.new_days,
+        timeout=args.timeout,
+        insecure_tls=args.insecure_tls,
+    )
+    new_unknown = []
+    for entry in new_candidates:
+        paper_id = entry_cache_id(entry)
+        if paper_id in state:
+            continue
+        if is_known_in_zotero(entry, zotero):
+            continue
+        new_unknown.append(entry)
+
+    classic_candidates = fetch_arxiv_entries(
+        keywords=keywords,
+        categories=categories,
+        max_results=args.classic_max_results,
+        sort_by="submittedDate",
+        sort_order="ascending",
+        days=None,
+        timeout=args.timeout,
+        insecure_tls=args.insecure_tls,
+    )
+    classic_unknown = [
+        entry for entry in classic_candidates if not is_known_in_zotero(entry, zotero)
+    ]
+    classic_scored = score_classics(
+        classic_unknown,
+        min_age_years=args.classic_min_age_years,
+        lookup_limit=args.classic_lookup_limit,
+        timeout=args.timeout,
+        insecure_tls=args.insecure_tls,
+    )
+
+    semantic_available = False
+    semantic_warning: str | None = None
+    semantic_metadata = SemanticRunMetadata(
+        ranking_mode="keyword fallback; semantic unavailable",
+        warning_message=None,
+        zotero_embedded_new=0,
+        zotero_cached_reused=0,
+        arxiv_embedded_new=0,
+        arxiv_cached_reused=0,
+    )
+
+    if semantic_mode == "off":
+        semantic_metadata.ranking_mode = "keyword only (semantic disabled)"
+    elif not openai_api_key:
+        semantic_warning = "OPENAI_API_KEY is missing"
+    else:
+        semantic_cache = SemanticCache(semantic_cache_path)
+        try:
+            semantic_cache.ensure_compatible(
+                model=embedding_model,
+                preprocess_version=DEFAULT_PREPROCESS_VERSION,
+                rebuild=args.rebuild_embeddings,
+            )
+            embedding_client = EmbeddingClient(
+                api_key=openai_api_key,
+                model=embedding_model,
+                timeout=args.timeout,
+                insecure_tls=args.insecure_tls,
+                batch_size=embedding_batch_size,
+            )
+
+            zotero_records = [
+                SemanticRecord(
+                    record_id=record.item_key,
+                    title=record.title,
+                    abstract=record.abstract,
+                )
+                for record in zotero.embedding_records
+            ]
+            zotero_vectors, zotero_stats = semantic_cache.sync_records(
+                table="zotero_embeddings",
+                id_column="item_key",
+                records=zotero_records,
+                model=embedding_model,
+                embed_texts=embedding_client.embed_texts,
+                preprocess_version=DEFAULT_PREPROCESS_VERSION,
+                prune_missing=True,
+            )
+            semantic_metadata.zotero_embedded_new = zotero_stats.embedded_new
+            semantic_metadata.zotero_cached_reused = zotero_stats.reused_cached
+
+            profile_vector = mean_vector(list(zotero_vectors.values()))
+            if profile_vector is None:
+                semantic_warning = "no embeddable Zotero records"
+            else:
+                candidate_records = build_candidate_semantic_records(
+                    [*new_unknown, *classic_scored]
+                )
+                candidate_vectors, arxiv_stats = semantic_cache.sync_records(
+                    table="arxiv_embeddings",
+                    id_column="paper_id",
+                    records=candidate_records,
+                    model=embedding_model,
+                    embed_texts=embedding_client.embed_texts,
+                    preprocess_version=DEFAULT_PREPROCESS_VERSION,
+                    prune_missing=False,
+                )
+                semantic_metadata.arxiv_embedded_new = arxiv_stats.embedded_new
+                semantic_metadata.arxiv_cached_reused = arxiv_stats.reused_cached
+
+                if not candidate_vectors:
+                    semantic_warning = "no embeddable arXiv candidates"
+                else:
+                    apply_semantic_scores(
+                        new_unknown,
+                        profile_vector=profile_vector,
+                        candidate_vectors=candidate_vectors,
+                        semantic_weight=semantic_weight,
+                        keyword_weight=keyword_weight,
+                    )
+                    apply_semantic_scores(
+                        classic_scored,
+                        profile_vector=profile_vector,
+                        candidate_vectors=candidate_vectors,
+                        semantic_weight=semantic_weight,
+                        keyword_weight=keyword_weight,
+                    )
+                    semantic_available = True
+                    semantic_metadata.ranking_mode = (
+                        "semantic (final_score = "
+                        f"{semantic_weight:.2f}*semantic + {keyword_weight:.2f}*keyword)"
+                    )
+        except Exception as exc:
+            semantic_warning = str(exc)
+        finally:
+            semantic_cache.close()
+
+    if not semantic_available:
+        apply_keyword_only_scores(new_unknown)
+        apply_keyword_only_scores(classic_scored)
+        if semantic_mode != "off":
+            semantic_metadata.warning_message = (
+                "Ranking mode: keyword fallback; semantic unavailable"
+                + (f" ({semantic_warning})" if semantic_warning else "")
+            )
+            print(f"Warning: {semantic_metadata.warning_message}")
+        else:
+            semantic_metadata.warning_message = "Semantic ranking disabled (--semantic off)."
+
+    sort_new_entries(new_unknown, semantic_available=semantic_available)
+    sort_classic_entries(classic_scored, semantic_available=semantic_available)
+
+    new_entries = new_unknown[: args.new_top_n]
+    classic_entries = classic_scored[: args.classic_top_n]
+
+    digest = build_digest(
+        new_entries=new_entries,
+        classic_entries=classic_entries,
+        categories=categories,
+        keywords_file=keywords_path,
+        new_days=args.new_days,
+        semantic_metadata=semantic_metadata,
+    )
+    args.report_file.parent.mkdir(parents=True, exist_ok=True)
+    args.report_file.write_text(digest, encoding="utf-8")
+    print(digest)
+
+    can_send = all([smtp_host, smtp_from, smtp_to])
+    if preview_only or not can_send:
+        if not can_send:
+            print(
+                "Email skipped: set SMTP_HOST, SMTP_FROM, and SMTP_TO (or ALERT_EMAIL_TO) "
+                "to enable delivery."
+            )
+        return 0
+
+    subject = f"arXiv digest: {today_local_iso()}"
+    send_email(
+        smtp_host=smtp_host or "",
+        smtp_port=smtp_port,
+        smtp_user=smtp_user,
+        smtp_password=smtp_password,
+        smtp_from=smtp_from or "",
+        smtp_to=smtp_to,
+        smtp_use_ssl=smtp_use_ssl,
+        subject=subject,
+        body=digest,
+    )
+    sent_today = today_local_iso()
+    for entry in new_entries:
+        paper_id = entry_cache_id(entry)
+        state[paper_id] = sent_today
+    save_state(args.state_file, state)
+    print(f"Email sent to: {', '.join(smtp_to)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

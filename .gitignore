@@ -23,3 +23,9 @@ venv/
 
 # Keep template keywords tracked; use this for private local variants
 search-arxiv-astrophysics/assets/keywords.local.txt
+
+# Local alert configuration and generated artifacts
+search-arxiv-astrophysics/.env
+search-arxiv-astrophysics/assets/daily_alert_state.json
+search-arxiv-astrophysics/assets/daily_alert_latest.md
+search-arxiv-astrophysics/assets/semantic_cache.sqlite
