@@ -5,12 +5,17 @@
 # - Inline comments after # are allowed.
 
 # Objects / systems
-neutron star, pulsar, magnetar, gravitational waves
+neutron star, pulsar, magnetar, gravitational wave
 
 # Dynamics / oscillations
-stability, asteroseismology, oscillation modes
+stability, seism, oscillation, modes
+
+# Pulsar physics
+pulsar timing, pulsar timing array, glitch
 
 # Accretion / high-energy
-accretion disk, magnetically arrested disk
-radiative efficiency, outflows, Bondi mass
-X-ray burst
+accret, accretion dis, magnetically arrest
+radiative efficiency, radiation efficiency, outflows, Bondi mass
+X-ray, burst
+
+# other interests
