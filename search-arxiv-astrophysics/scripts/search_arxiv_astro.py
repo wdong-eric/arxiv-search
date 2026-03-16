@@ -15,7 +15,9 @@ import argparse
 import json
 import os
 import re
+import socket
 import ssl
+import time
 from pathlib import Path
 import urllib.error
 import urllib.parse
@@ -27,6 +29,7 @@ from typing import Iterable
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 ARXIV_API_URL_HTTP = "http://export.arxiv.org/api/query"
 DEFAULT_TIMEOUT = 20
+NETWORK_MAX_RETRIES = 4
 DEFAULT_CATEGORIES = [
     "astro-ph.CO",
     "astro-ph.EP",
@@ -291,8 +294,37 @@ def _http_get(url: str, timeout: int, insecure_tls: bool = False) -> bytes:
     context = None
     if insecure_tls and url.startswith("https://"):
         context = ssl._create_unverified_context()
-    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
-        return response.read()
+    delay_seconds = 1.0
+    last_error: Exception | None = None
+
+    for attempt in range(NETWORK_MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=timeout, context=context
+            ) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in {408, 409, 425, 429, 500, 502, 503, 504} and attempt < NETWORK_MAX_RETRIES - 1:
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
+                continue
+            raise
+        except urllib.error.URLError as exc:
+            last_error = exc
+            reason = getattr(exc, "reason", exc)
+            is_timeout = isinstance(reason, (TimeoutError, socket.timeout)) or (
+                isinstance(reason, ssl.SSLError) and "timed out" in str(reason).lower()
+            ) or ("timed out" in str(reason).lower())
+            if is_timeout and attempt < NETWORK_MAX_RETRIES - 1:
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to fetch HTTP data from {url}.")
 
 
 def fetch_feed(url: str, timeout: int, insecure_tls: bool = False) -> bytes:

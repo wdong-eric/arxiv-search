@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import socket
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.parse
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -15,6 +17,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import daily_arxiv_zotero_alert as alert
+import search_arxiv_astro as arxiv_search
 
 
 def make_entry(
@@ -57,18 +60,96 @@ class DailyAlertSemanticTests(unittest.TestCase):
         self.assertIn("cat:gr-qc", query)
         self.assertNotIn("all:", query)
 
-    def test_semantic_weighted_ranking_is_deterministic(self) -> None:
+    def test_fetch_zotero_index_includes_collection_paths(self) -> None:
+        collection_payload = [
+            {
+                "key": "parent",
+                "data": {
+                    "name": "Cosmology",
+                    "parentCollection": False,
+                },
+            },
+            {
+                "key": "child",
+                "data": {
+                    "name": "CMB",
+                    "parentCollection": "parent",
+                },
+            },
+        ]
+        item_payload = [
+            {
+                "key": "item-1",
+                "data": {
+                    "title": "Acoustic peaks",
+                    "abstractNote": "CMB analysis",
+                    "collections": ["child"],
+                },
+            }
+        ]
+
+        with mock.patch.object(
+            alert,
+            "safe_json_get",
+            side_effect=[collection_payload, item_payload],
+        ):
+            index = alert.fetch_zotero_index(
+                user_id="1",
+                api_key="dummy",
+                max_items=10,
+                timeout=5,
+            )
+
+        self.assertEqual(index.collection_names["child"], "Cosmology / CMB")
+        self.assertEqual(index.embedding_records[0].collection_keys, ["child"])
+
+    def test_safe_json_get_retries_timeout_urlerror(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"[]"
+
+        with mock.patch.object(
+            alert.urllib.request,
+            "urlopen",
+            side_effect=[urllib.error.URLError(socket.timeout("timed out")), response],
+        ) as mock_urlopen, mock.patch.object(alert.time, "sleep", return_value=None):
+            payload = alert.safe_json_get(
+                "https://example.com",
+                headers=None,
+                timeout=5,
+            )
+
+        self.assertEqual(payload, [])
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    def test_fetch_feed_retries_timeout_urlerror(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"<feed />"
+
+        with mock.patch.object(
+            arxiv_search.urllib.request,
+            "urlopen",
+            side_effect=[urllib.error.URLError(socket.timeout("timed out")), response],
+        ) as mock_urlopen, mock.patch.object(arxiv_search.time, "sleep", return_value=None):
+            payload = arxiv_search.fetch_feed(
+                "https://example.com",
+                timeout=5,
+            )
+
+        self.assertEqual(payload, b"<feed />")
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    def test_collection_centroid_scoring_handles_multitopic_library(self) -> None:
         entries = [
             make_entry(
                 "1111.1111",
-                "Semantically close",
+                "Strong match to one collection",
                 "topic a",
                 "2020-01-01T00:00:00",
                 keyword_score=0,
             ),
             make_entry(
                 "2222.2222",
-                "Keyword heavy",
+                "Closer to the global average",
                 "topic b",
                 "2020-01-01T00:00:00",
                 keyword_score=10,
@@ -76,17 +157,26 @@ class DailyAlertSemanticTests(unittest.TestCase):
         ]
         alert.apply_semantic_scores(
             entries,
-            profile_vector=[1.0, 0.0],
+            collection_centroids={
+                "col-a": [1.0, 0.0],
+                "col-b": [0.0, 1.0],
+            },
+            collection_names={
+                "col-a": "Cosmology",
+                "col-b": "Gravitational Waves",
+            },
             candidate_vectors={
                 "1111.1111": [1.0, 0.0],
-                "2222.2222": [0.0, 1.0],
+                "2222.2222": [0.70710678, 0.70710678],
             },
             semantic_weight=0.90,
             keyword_weight=0.10,
         )
         alert.sort_new_entries(entries, semantic_available=True)
         self.assertEqual(entries[0]["id"], "https://arxiv.org/abs/1111.1111")
-        self.assertAlmostEqual(entries[0]["final_score"], 0.9, places=6)
+        self.assertAlmostEqual(entries[0]["semantic_score"], 1.0, places=6)
+        self.assertEqual(entries[0]["semantic_collection"], "Cosmology")
+        self.assertLess(entries[1]["semantic_score"], entries[0]["semantic_score"])
 
     def test_keyword_fallback_warns_and_writes_digest_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -113,6 +203,7 @@ class DailyAlertSemanticTests(unittest.TestCase):
                 dois=set(),
                 titles=set(),
                 embedding_records=[],
+                collection_names={},
             )
             new_entries = [
                 make_entry(
@@ -206,8 +297,10 @@ class DailyAlertSemanticTests(unittest.TestCase):
                         item_key="item-1",
                         title="Dark matter constraints",
                         abstract="Survey of constraints.",
+                        collection_keys=["cosmo"],
                     )
                 ],
+                collection_names={"cosmo": "Cosmology"},
             )
 
             new_entries = [
@@ -281,6 +374,7 @@ class DailyAlertSemanticTests(unittest.TestCase):
             self.assertIn("- Ranking mode: semantic", digest)
             self.assertIn("- Final score:", digest)
             self.assertIn("- Semantic score:", digest)
+            self.assertIn("- Best collection match: Cosmology", digest)
             self.assertIn("Novel Candidate", digest)
             self.assertNotIn("Known Zotero Paper", digest)
 

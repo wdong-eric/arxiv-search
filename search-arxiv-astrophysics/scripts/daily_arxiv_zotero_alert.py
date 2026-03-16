@@ -12,8 +12,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import socket
 import smtplib
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,16 +48,20 @@ from semantic_profile import (
 
 DEFAULT_TIMEOUT = 20
 STATE_RETENTION_DAYS = 120
+NETWORK_MAX_RETRIES = 4
 ARXIV_ID_RE = re.compile(
     r"(?i)(?:arxiv:|https?://arxiv\.org/(?:abs|pdf)/)"
     r"([a-z\-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?"
 )
 ARXIV_ID_BARE_RE = re.compile(r"(?i)\b([a-z\-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?\b")
 ZOTERO_API_URL_TMPL = "https://api.zotero.org/users/{user_id}/items"
+ZOTERO_COLLECTIONS_URL_TMPL = "https://api.zotero.org/users/{user_id}/collections"
 SEMANTIC_SCHOLAR_TMPL = (
     "https://api.semanticscholar.org/graph/v1/paper/ARXIV:{paper_id}"
     "?fields=citationCount"
 )
+UNFILED_COLLECTION_KEY = "__unfiled__"
+UNFILED_COLLECTION_NAME = "Unfiled"
 
 
 @dataclass
@@ -63,6 +69,7 @@ class ZoteroEmbeddingRecord:
     item_key: str
     title: str
     abstract: str
+    collection_keys: list[str]
 
 
 @dataclass
@@ -71,6 +78,7 @@ class ZoteroIndex:
     dois: set[str]
     titles: set[str]
     embedding_records: list[ZoteroEmbeddingRecord]
+    collection_names: dict[str, str]
 
 
 @dataclass
@@ -389,8 +397,97 @@ def safe_json_get(
         },
     )
     context = ssl._create_unverified_context() if insecure_tls else None
-    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
-        return json.loads(response.read().decode("utf-8"))
+    delay_seconds = 1.0
+    last_error: Exception | None = None
+
+    for attempt in range(NETWORK_MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=timeout, context=context
+            ) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code in {408, 409, 425, 429, 500, 502, 503, 504} and attempt < NETWORK_MAX_RETRIES - 1:
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
+                continue
+            raise
+        except urllib.error.URLError as exc:
+            last_error = exc
+            reason = getattr(exc, "reason", exc)
+            is_timeout = isinstance(reason, (TimeoutError, socket.timeout)) or (
+                isinstance(reason, ssl.SSLError) and "timed out" in str(reason).lower()
+            ) or ("timed out" in str(reason).lower())
+            if is_timeout and attempt < NETWORK_MAX_RETRIES - 1:
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to fetch JSON from {url}.")
+
+
+def fetch_zotero_collection_names(
+    user_id: str,
+    api_key: str,
+    timeout: int,
+    insecure_tls: bool = False,
+) -> dict[str, str]:
+    raw_collections: dict[str, tuple[str, str | None]] = {}
+    limit = 100
+    fetched = 0
+
+    while True:
+        params = urllib.parse.urlencode(
+            {"format": "json", "start": fetched, "limit": limit}
+        )
+        url = f"{ZOTERO_COLLECTIONS_URL_TMPL.format(user_id=user_id)}?{params}"
+        payload = safe_json_get(
+            url,
+            headers={"Zotero-API-Key": api_key},
+            timeout=timeout,
+            insecure_tls=insecure_tls,
+        )
+        if not isinstance(payload, list) or not payload:
+            break
+
+        for item in payload:
+            data = item.get("data", {})
+            collection_key = str(item.get("key", "") or "").strip()
+            if not collection_key:
+                continue
+            name = str(data.get("name", "") or collection_key).strip() or collection_key
+            parent_raw = str(data.get("parentCollection", "") or "").strip()
+            raw_collections[collection_key] = (name, parent_raw or None)
+
+        fetched += len(payload)
+        if len(payload) < limit:
+            break
+
+    def resolve_collection_name(
+        collection_key: str,
+        seen: set[str] | None = None,
+    ) -> str:
+        if collection_key not in raw_collections:
+            return collection_key
+        if seen is None:
+            seen = set()
+        if collection_key in seen:
+            return raw_collections[collection_key][0]
+
+        name, parent_key = raw_collections[collection_key]
+        if not parent_key:
+            return name
+        parent_name = resolve_collection_name(parent_key, seen | {collection_key})
+        return f"{parent_name} / {name}"
+
+    return {
+        collection_key: resolve_collection_name(collection_key)
+        for collection_key in raw_collections
+    }
 
 
 def fetch_zotero_index(
@@ -404,6 +501,12 @@ def fetch_zotero_index(
     dois: set[str] = set()
     titles: set[str] = set()
     embedding_records: list[ZoteroEmbeddingRecord] = []
+    collection_names = fetch_zotero_collection_names(
+        user_id=user_id,
+        api_key=api_key,
+        timeout=timeout,
+        insecure_tls=insecure_tls,
+    )
     limit = 100
     fetched = 0
 
@@ -426,6 +529,11 @@ def fetch_zotero_index(
             data = item.get("data", {})
             title_raw = str(data.get("title", "") or "")
             abstract_raw = str(data.get("abstractNote", "") or "")
+            collection_keys = [
+                str(collection_key).strip()
+                for collection_key in data.get("collections", [])
+                if str(collection_key).strip()
+            ]
 
             title = normalize_title(title_raw)
             if title:
@@ -454,6 +562,7 @@ def fetch_zotero_index(
                         item_key=item_key,
                         title=title_raw,
                         abstract=abstract_raw,
+                        collection_keys=collection_keys,
                     )
                 )
 
@@ -466,6 +575,7 @@ def fetch_zotero_index(
         dois=dois,
         titles=titles,
         embedding_records=embedding_records,
+        collection_names=collection_names,
     )
 
 
@@ -648,10 +758,59 @@ def attach_keyword_score_norm(entries: list[dict]) -> None:
         entry["keyword_score_norm"] = keyword_norm
 
 
+def build_collection_centroids(
+    embedding_records: list[ZoteroEmbeddingRecord],
+    zotero_vectors: dict[str, list[float]],
+    collection_names: dict[str, str],
+) -> tuple[dict[str, list[float]], dict[str, str]]:
+    grouped_vectors: dict[str, list[list[float]]] = {}
+    resolved_collection_names = dict(collection_names)
+
+    for record in embedding_records:
+        vector = zotero_vectors.get(record.item_key)
+        if vector is None:
+            continue
+        target_keys = record.collection_keys or [UNFILED_COLLECTION_KEY]
+        for collection_key in target_keys:
+            grouped_vectors.setdefault(collection_key, []).append(vector)
+            if collection_key not in resolved_collection_names:
+                resolved_collection_names[collection_key] = collection_key
+
+    if UNFILED_COLLECTION_KEY in grouped_vectors:
+        resolved_collection_names[UNFILED_COLLECTION_KEY] = UNFILED_COLLECTION_NAME
+
+    centroids: dict[str, list[float]] = {}
+    for collection_key, vectors in grouped_vectors.items():
+        centroid = mean_vector(vectors)
+        if centroid is not None:
+            centroids[collection_key] = centroid
+
+    return centroids, resolved_collection_names
+
+
+def best_collection_match(
+    candidate_vector: list[float],
+    collection_centroids: dict[str, list[float]],
+    collection_names: dict[str, str],
+) -> tuple[float, str | None]:
+    if not collection_centroids:
+        return 0.0, None
+
+    best_key = max(
+        collection_centroids,
+        key=lambda collection_key: cosine_similarity(
+            candidate_vector, collection_centroids[collection_key]
+        ),
+    )
+    best_score = cosine_similarity(candidate_vector, collection_centroids[best_key])
+    return best_score, collection_names.get(best_key, best_key)
+
+
 def apply_semantic_scores(
     entries: list[dict],
     *,
-    profile_vector: list[float],
+    collection_centroids: dict[str, list[float]],
+    collection_names: dict[str, str],
     candidate_vectors: dict[str, list[float]],
     semantic_weight: float,
     keyword_weight: float,
@@ -659,10 +818,16 @@ def apply_semantic_scores(
     attach_keyword_score_norm(entries)
     for entry in entries:
         semantic_score = 0.0
+        semantic_collection = None
         candidate_vector = candidate_vectors.get(entry_cache_id(entry))
         if candidate_vector is not None:
-            semantic_score = cosine_similarity(profile_vector, candidate_vector)
+            semantic_score, semantic_collection = best_collection_match(
+                candidate_vector,
+                collection_centroids,
+                collection_names,
+            )
         entry["semantic_score"] = semantic_score
+        entry["semantic_collection"] = semantic_collection
         entry["final_score"] = (
             semantic_weight * semantic_score
             + keyword_weight * float(entry.get("keyword_score_norm", 0.0))
@@ -673,6 +838,7 @@ def apply_keyword_only_scores(entries: list[dict]) -> None:
     attach_keyword_score_norm(entries)
     for entry in entries:
         entry["semantic_score"] = None
+        entry["semantic_collection"] = None
         entry["final_score"] = float(entry.get("keyword_score_norm", 0.0))
 
 
@@ -749,6 +915,8 @@ def format_lines(entries: Iterable[dict], include_citations: bool = False) -> li
         )
         if entry.get("semantic_score") is not None:
             lines.append(f"   - Semantic score: {float(entry.get('semantic_score', 0.0)):.4f}")
+        if entry.get("semantic_collection"):
+            lines.append(f"   - Best collection match: {entry['semantic_collection']}")
         lines.append(f"   - Final score: {float(entry.get('final_score', 0.0)):.4f}")
         lines.append(f"   - Matched keywords: {matched}")
         if include_citations:
@@ -1066,8 +1234,13 @@ def main() -> int:
             semantic_metadata.zotero_embedded_new = zotero_stats.embedded_new
             semantic_metadata.zotero_cached_reused = zotero_stats.reused_cached
 
-            profile_vector = mean_vector(list(zotero_vectors.values()))
-            if profile_vector is None:
+            collection_centroids, collection_names = build_collection_centroids(
+                zotero.embedding_records,
+                zotero_vectors,
+                zotero.collection_names,
+            )
+
+            if not collection_centroids:
                 semantic_warning = "no embeddable Zotero records"
             else:
                 candidate_records = build_candidate_semantic_records(
@@ -1090,21 +1263,24 @@ def main() -> int:
                 else:
                     apply_semantic_scores(
                         new_unknown,
-                        profile_vector=profile_vector,
+                        collection_centroids=collection_centroids,
+                        collection_names=collection_names,
                         candidate_vectors=candidate_vectors,
                         semantic_weight=semantic_weight,
                         keyword_weight=keyword_weight,
                     )
                     apply_semantic_scores(
                         classic_scored,
-                        profile_vector=profile_vector,
+                        collection_centroids=collection_centroids,
+                        collection_names=collection_names,
                         candidate_vectors=candidate_vectors,
                         semantic_weight=semantic_weight,
                         keyword_weight=keyword_weight,
                     )
                     semantic_available = True
                     semantic_metadata.ranking_mode = (
-                        "semantic (final_score = "
+                        "semantic per-collection centroid "
+                        f"({len(collection_centroids)} profiles; final_score = "
                         f"{semantic_weight:.2f}*semantic + {keyword_weight:.2f}*keyword)"
                     )
         except Exception as exc:
