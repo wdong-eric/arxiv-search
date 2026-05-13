@@ -138,6 +138,39 @@ class DailyAlertSemanticTests(unittest.TestCase):
         self.assertEqual(payload, b"<feed />")
         self.assertEqual(mock_urlopen.call_count, 2)
 
+    def test_select_classic_entries_samples_from_top_pool(self) -> None:
+        classics = []
+        for idx in range(7):
+            entry = make_entry(
+                f"9999.000{idx}",
+                f"Classic {idx}",
+                "classic abstract",
+                "2010-01-01T00:00:00",
+                keyword_score=7 - idx,
+            )
+            entry["citation_count"] = 100 - idx
+            entry["age_years"] = 10 + idx
+            classics.append(entry)
+
+        alert.sort_classic_entries(classics, semantic_available=False)
+        sampled_pool = [classics[4], classics[1], classics[5], classics[0], classics[2]]
+
+        with mock.patch.object(alert.random, "sample", return_value=sampled_pool) as mock_sample:
+            selected = alert.select_classic_entries(
+                classics,
+                classic_top_n=5,
+                classic_pool_size=6,
+                semantic_available=False,
+            )
+
+        self.assertEqual(mock_sample.call_count, 1)
+        self.assertEqual(mock_sample.call_args.args[0], classics[:6])
+        self.assertEqual(len(selected), 5)
+        self.assertEqual(
+            {entry["id"] for entry in selected},
+            {entry["id"] for entry in sampled_pool},
+        )
+
     def test_collection_centroid_scoring_handles_multitopic_library(self) -> None:
         entries = [
             make_entry(

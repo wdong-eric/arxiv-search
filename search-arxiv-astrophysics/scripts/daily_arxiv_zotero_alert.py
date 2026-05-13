@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import socket
 import smtplib
@@ -219,8 +220,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--classic-top-n",
         type=int,
-        default=8,
-        help="Max classics included in digest. Default: 8.",
+        default=3,
+        help="Max classics included in digest. Default: 3.",
+    )
+    parser.add_argument(
+        "--classic-pool-size",
+        type=int,
+        default=50,
+        help=(
+            "Randomly sample classics from the top-ranked pool of this size. "
+            "Default: 50."
+        ),
     )
     parser.add_argument(
         "--zotero-user-id",
@@ -883,6 +893,26 @@ def sort_classic_entries(entries: list[dict], semantic_available: bool) -> None:
     )
 
 
+def select_classic_entries(
+    entries: list[dict],
+    *,
+    classic_top_n: int,
+    classic_pool_size: int,
+    semantic_available: bool,
+) -> list[dict]:
+    if classic_top_n <= 0 or not entries:
+        return []
+
+    pool_limit = max(classic_top_n, classic_pool_size)
+    candidate_pool = list(entries[:pool_limit])
+    if len(candidate_pool) <= classic_top_n:
+        return candidate_pool
+
+    selected = random.sample(candidate_pool, classic_top_n)
+    sort_classic_entries(selected, semantic_available=semantic_available)
+    return selected
+
+
 def build_candidate_semantic_records(entries: Iterable[dict]) -> list[SemanticRecord]:
     records: dict[str, SemanticRecord] = {}
     for entry in entries:
@@ -1304,7 +1334,12 @@ def main() -> int:
     sort_classic_entries(classic_scored, semantic_available=semantic_available)
 
     new_entries = new_unknown[: args.new_top_n]
-    classic_entries = classic_scored[: args.classic_top_n]
+    classic_entries = select_classic_entries(
+        classic_scored,
+        classic_top_n=args.classic_top_n,
+        classic_pool_size=args.classic_pool_size,
+        semantic_available=semantic_available,
+    )
 
     digest = build_digest(
         new_entries=new_entries,
