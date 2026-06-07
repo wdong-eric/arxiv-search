@@ -261,6 +261,14 @@ def parse_args() -> argparse.Namespace:
         help="Path to write latest digest report.",
     )
     parser.add_argument(
+        "--send-existing-report",
+        action="store_true",
+        help=(
+            "Email --report-file without regenerating the digest, querying Zotero, "
+            "fetching arXiv, updating embeddings, or changing sent state."
+        ),
+    )
+    parser.add_argument(
         "--smtp-host",
         default=None,
         help="SMTP host. Defaults from env.",
@@ -1041,10 +1049,94 @@ def send_email(
         server.send_message(message)
 
 
+def resolve_smtp_settings(
+    args: argparse.Namespace,
+    env_values: dict[str, str],
+) -> tuple[str | None, int, str | None, str | None, str | None, list[str], bool]:
+    smtp_host = first_non_empty(args.smtp_host, env_values.get("SMTP_HOST"))
+    smtp_port = args.smtp_port or int(first_non_empty(env_values.get("SMTP_PORT"), "587") or "587")
+    smtp_user = first_non_empty(args.smtp_user, env_values.get("SMTP_USER"))
+    smtp_password = first_non_empty(args.smtp_password, env_values.get("SMTP_PASSWORD"))
+    smtp_from = first_non_empty(args.smtp_from, env_values.get("SMTP_FROM"))
+    smtp_to_raw = first_non_empty(
+        args.smtp_to,
+        env_values.get("SMTP_TO"),
+        env_values.get("ALERT_EMAIL_TO"),
+    )
+    smtp_to = [addr.strip() for addr in (smtp_to_raw or "").split(",") if addr.strip()]
+    smtp_use_ssl = args.smtp_use_ssl or parse_env_bool(
+        env_values.get("SMTP_USE_SSL"), default=False
+    )
+    return (
+        smtp_host,
+        smtp_port,
+        smtp_user,
+        smtp_password,
+        smtp_from,
+        smtp_to,
+        smtp_use_ssl,
+    )
+
+
+def validate_email_delivery_settings(
+    *,
+    smtp_host: str | None,
+    smtp_from: str | None,
+    smtp_to: list[str],
+) -> None:
+    missing = []
+    if not smtp_host:
+        missing.append("SMTP_HOST")
+    if not smtp_from:
+        missing.append("SMTP_FROM")
+    if not smtp_to:
+        missing.append("SMTP_TO or ALERT_EMAIL_TO")
+    if missing:
+        raise ValueError("Missing email delivery settings: " + ", ".join(missing))
+
+
 def main() -> int:
     args = parse_args()
     base_dir = Path(__file__).resolve().parents[1]
     env_values = parse_env_file(args.env_file)
+    (
+        smtp_host,
+        smtp_port,
+        smtp_user,
+        smtp_password,
+        smtp_from,
+        smtp_to,
+        smtp_use_ssl,
+    ) = resolve_smtp_settings(args, env_values)
+    preview_only = args.preview_only or parse_env_bool(
+        env_values.get("ALERT_PREVIEW_ONLY"), default=False
+    )
+
+    if args.send_existing_report:
+        if not args.report_file.exists():
+            raise FileNotFoundError(f"Report file not found: {args.report_file}")
+        digest = args.report_file.read_text(encoding="utf-8")
+        print(digest)
+        if preview_only:
+            return 0
+        validate_email_delivery_settings(
+            smtp_host=smtp_host,
+            smtp_from=smtp_from,
+            smtp_to=smtp_to,
+        )
+        send_email(
+            smtp_host=smtp_host or "",
+            smtp_port=smtp_port,
+            smtp_user=smtp_user,
+            smtp_password=smtp_password,
+            smtp_from=smtp_from or "",
+            smtp_to=smtp_to,
+            smtp_use_ssl=smtp_use_ssl,
+            subject=f"arXiv digest resend: {today_local_iso()}",
+            body=digest,
+        )
+        print(f"Existing report emailed to: {', '.join(smtp_to)}")
+        return 0
 
     categories_env = first_non_empty(env_values.get("ARXIV_CATEGORIES"), None)
     categories = args.category or []
@@ -1144,24 +1236,6 @@ def main() -> int:
             "Missing Zotero credentials. Provide ZOTERO_USER_ID and ZOTERO_API_KEY "
             "via --env-file or command flags."
         )
-
-    preview_only = args.preview_only or parse_env_bool(
-        env_values.get("ALERT_PREVIEW_ONLY"), default=False
-    )
-    smtp_host = first_non_empty(args.smtp_host, env_values.get("SMTP_HOST"))
-    smtp_port = args.smtp_port or int(first_non_empty(env_values.get("SMTP_PORT"), "587") or "587")
-    smtp_user = first_non_empty(args.smtp_user, env_values.get("SMTP_USER"))
-    smtp_password = first_non_empty(args.smtp_password, env_values.get("SMTP_PASSWORD"))
-    smtp_from = first_non_empty(args.smtp_from, env_values.get("SMTP_FROM"))
-    smtp_to_raw = first_non_empty(
-        args.smtp_to,
-        env_values.get("SMTP_TO"),
-        env_values.get("ALERT_EMAIL_TO"),
-    )
-    smtp_to = [addr.strip() for addr in (smtp_to_raw or "").split(",") if addr.strip()]
-    smtp_use_ssl = args.smtp_use_ssl or parse_env_bool(
-        env_values.get("SMTP_USE_SSL"), default=False
-    )
 
     zotero = fetch_zotero_index(
         user_id=zotero_user_id,
