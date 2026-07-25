@@ -171,6 +171,71 @@ class DailyAlertSemanticTests(unittest.TestCase):
             {entry["id"] for entry in sampled_pool},
         )
 
+    def test_select_new_entries_by_semantic_threshold_without_top_n_cap(self) -> None:
+        entries = [
+            {"id": "above-1", "semantic_score": 0.70, "final_score": 0.40},
+            {"id": "above-2", "semantic_score": 0.66, "final_score": 0.30},
+            {"id": "equal", "semantic_score": 0.65, "final_score": 0.90},
+        ]
+
+        selected = alert.select_new_entries(
+            entries,
+            new_top_n=1,
+            semantic_threshold=0.65,
+            overall_threshold=None,
+            semantic_available=True,
+        )
+
+        self.assertEqual([entry["id"] for entry in selected], ["above-1", "above-2"])
+
+    def test_select_new_entries_combines_thresholds_with_and(self) -> None:
+        entries = [
+            {"id": "both-1", "semantic_score": 0.70, "final_score": 0.70},
+            {"id": "overall-equal", "semantic_score": 0.75, "final_score": 0.65},
+            {"id": "semantic-low", "semantic_score": 0.64, "final_score": 0.80},
+            {"id": "both-2", "semantic_score": 0.80, "final_score": 0.90},
+        ]
+
+        selected = alert.select_new_entries(
+            entries,
+            new_top_n=1,
+            semantic_threshold=0.65,
+            overall_threshold=0.65,
+            semantic_available=True,
+        )
+
+        self.assertEqual([entry["id"] for entry in selected], ["both-1", "both-2"])
+
+    def test_select_new_entries_keeps_top_n_as_default_mode(self) -> None:
+        entries = [{"id": "first"}, {"id": "second"}, {"id": "third"}]
+
+        selected = alert.select_new_entries(
+            entries,
+            new_top_n=2,
+            semantic_threshold=None,
+            overall_threshold=None,
+            semantic_available=False,
+        )
+
+        self.assertEqual([entry["id"] for entry in selected], ["first", "second"])
+
+    def test_select_new_entries_rejects_thresholds_without_semantic_scores(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "require semantic scoring"):
+            alert.select_new_entries(
+                [{"id": "candidate", "semantic_score": None, "final_score": 1.0}],
+                new_top_n=12,
+                semantic_threshold=None,
+                overall_threshold=0.65,
+                semantic_available=False,
+            )
+
+    def test_score_threshold_validation_rejects_non_finite_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "between -1 and 1"):
+            alert.parse_optional_score_threshold(
+                "nan",
+                setting_name="NEW_SEMANTIC_THRESHOLD",
+            )
+
     def test_collection_centroid_scoring_handles_multitopic_library(self) -> None:
         entries = [
             make_entry(
@@ -390,6 +455,10 @@ class DailyAlertSemanticTests(unittest.TestCase):
                     str(semantic_cache),
                     "--semantic",
                     "on",
+                    "--new-semantic-threshold",
+                    "0.65",
+                    "--new-overall-threshold",
+                    "0.65",
                 ],
             ), mock.patch.object(alert, "fetch_zotero_index", return_value=index), mock.patch.object(
                 alert,
@@ -404,6 +473,10 @@ class DailyAlertSemanticTests(unittest.TestCase):
 
             self.assertEqual(return_code, 0)
             digest = report_file.read_text(encoding="utf-8")
+            self.assertIn(
+                "- New-paper selection: semantic score > 0.65 and overall score > 0.65",
+                digest,
+            )
             self.assertIn("- Ranking mode: semantic", digest)
             self.assertIn("- Final score:", digest)
             self.assertIn("- Semantic score:", digest)

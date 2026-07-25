@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
-import socket
 import smtplib
+import socket
 import ssl
 import time
 import urllib.error
@@ -48,6 +49,7 @@ from semantic_profile import (
 )
 
 DEFAULT_TIMEOUT = 20
+DEFAULT_NEW_TOP_N = 12
 STATE_RETENTION_DAYS = 120
 NETWORK_MAX_RETRIES = 4
 ARXIV_ID_RE = re.compile(
@@ -196,8 +198,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--new-top-n",
         type=int,
-        default=12,
-        help="Max new papers included in digest. Default: 12.",
+        default=None,
+        help=(
+            "Max new papers included in digest. Cannot be combined with score "
+            f"thresholds. Default when no threshold is set: {DEFAULT_NEW_TOP_N}."
+        ),
+    )
+    parser.add_argument(
+        "--new-semantic-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Include new papers only when semantic_score is strictly greater "
+            "than this value. May be combined with --new-overall-threshold."
+        ),
+    )
+    parser.add_argument(
+        "--new-overall-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Include new papers only when final_score (the weighted overall score) "
+            "is strictly greater than this value. May be combined with "
+            "--new-semantic-threshold."
+        ),
     )
     parser.add_argument(
         "--classic-max-results",
@@ -361,6 +385,22 @@ def parse_env_float(raw_value: str | None, default: float) -> float:
         return float(raw_value)
     except ValueError:
         return default
+
+
+def parse_optional_score_threshold(
+    raw_value: float | str | None,
+    *,
+    setting_name: str,
+) -> float | None:
+    if raw_value is None or not str(raw_value).strip():
+        return None
+    try:
+        threshold = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{setting_name} must be a number.") from exc
+    if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
+        raise ValueError(f"{setting_name} must be between -1 and 1.")
+    return threshold
 
 
 def parse_env_int(raw_value: str | None, default: int) -> int:
@@ -879,6 +919,39 @@ def sort_new_entries(entries: list[dict], semantic_available: bool) -> None:
     )
 
 
+def select_new_entries(
+    entries: list[dict],
+    *,
+    new_top_n: int,
+    semantic_threshold: float | None,
+    overall_threshold: float | None,
+    semantic_available: bool,
+) -> list[dict]:
+    threshold_mode = semantic_threshold is not None or overall_threshold is not None
+    if not threshold_mode:
+        return list(entries[:new_top_n])
+    if not semantic_available:
+        raise RuntimeError(
+            "New-paper score thresholds require semantic scoring, but semantic "
+            "scoring is unavailable. Check OPENAI_API_KEY and the semantic warning."
+        )
+
+    selected = []
+    for entry in entries:
+        semantic_score = entry.get("semantic_score")
+        overall_score = entry.get("final_score")
+        if semantic_threshold is not None and (
+            semantic_score is None or float(semantic_score) <= semantic_threshold
+        ):
+            continue
+        if overall_threshold is not None and (
+            overall_score is None or float(overall_score) <= overall_threshold
+        ):
+            continue
+        selected.append(entry)
+    return selected
+
+
 def sort_classic_entries(entries: list[dict], semantic_available: bool) -> None:
     if semantic_available:
         entries.sort(
@@ -974,6 +1047,7 @@ def build_digest(
     categories: list[str],
     keywords_file: Path,
     new_days: int,
+    new_selection_description: str,
     semantic_metadata: SemanticRunMetadata,
 ) -> str:
     today = today_local_iso()
@@ -984,6 +1058,7 @@ def build_digest(
         f"- Categories: {', '.join(categories)}",
         f"- Keyword file: {keywords_file}",
         f"- New-paper window: last {new_days} day(s)",
+        f"- New-paper selection: {new_selection_description}",
         f"- Ranking mode: {semantic_metadata.ranking_mode}",
         (
             "- Semantic cache updates: "
@@ -1173,6 +1248,35 @@ def main() -> int:
     if semantic_mode not in {"auto", "on", "off"}:
         raise ValueError("SEMANTIC_MODE must be one of auto|on|off.")
 
+    semantic_threshold = parse_optional_score_threshold(
+        (
+            args.new_semantic_threshold
+            if args.new_semantic_threshold is not None
+            else env_values.get("NEW_SEMANTIC_THRESHOLD")
+        ),
+        setting_name="--new-semantic-threshold/NEW_SEMANTIC_THRESHOLD",
+    )
+    overall_threshold = parse_optional_score_threshold(
+        (
+            args.new_overall_threshold
+            if args.new_overall_threshold is not None
+            else env_values.get("NEW_OVERALL_THRESHOLD")
+        ),
+        setting_name="--new-overall-threshold/NEW_OVERALL_THRESHOLD",
+    )
+    threshold_mode = semantic_threshold is not None or overall_threshold is not None
+    if args.new_top_n is not None and threshold_mode:
+        raise ValueError(
+            "--new-top-n cannot be combined with new-paper score thresholds."
+        )
+    new_top_n = DEFAULT_NEW_TOP_N if args.new_top_n is None else args.new_top_n
+    if new_top_n < 0:
+        raise ValueError("--new-top-n must be non-negative.")
+    if threshold_mode and semantic_mode == "off":
+        raise ValueError(
+            "New-paper score thresholds cannot be used with semantic scoring disabled."
+        )
+
     semantic_cache_path_raw = first_non_empty(
         str(args.semantic_cache_path) if args.semantic_cache_path else None,
         env_values.get("SEMANTIC_CACHE_PATH"),
@@ -1228,6 +1332,10 @@ def main() -> int:
         args.openai_api_key,
         env_values.get("OPENAI_API_KEY"),
     )
+    if threshold_mode and not openai_api_key:
+        raise ValueError(
+            "New-paper score thresholds require OPENAI_API_KEY for semantic scoring."
+        )
 
     zotero_user_id = first_non_empty(args.zotero_user_id, env_values.get("ZOTERO_USER_ID"))
     zotero_api_key = first_non_empty(args.zotero_api_key, env_values.get("ZOTERO_API_KEY"))
@@ -1407,7 +1515,22 @@ def main() -> int:
     sort_new_entries(new_unknown, semantic_available=semantic_available)
     sort_classic_entries(classic_scored, semantic_available=semantic_available)
 
-    new_entries = new_unknown[: args.new_top_n]
+    new_entries = select_new_entries(
+        new_unknown,
+        new_top_n=new_top_n,
+        semantic_threshold=semantic_threshold,
+        overall_threshold=overall_threshold,
+        semantic_available=semantic_available,
+    )
+    if threshold_mode:
+        selection_parts = []
+        if semantic_threshold is not None:
+            selection_parts.append(f"semantic score > {semantic_threshold:g}")
+        if overall_threshold is not None:
+            selection_parts.append(f"overall score > {overall_threshold:g}")
+        new_selection_description = " and ".join(selection_parts)
+    else:
+        new_selection_description = f"top {new_top_n} by ranking"
     classic_entries = select_classic_entries(
         classic_scored,
         classic_top_n=args.classic_top_n,
@@ -1421,6 +1544,7 @@ def main() -> int:
         categories=categories,
         keywords_file=keywords_path,
         new_days=args.new_days,
+        new_selection_description=new_selection_description,
         semantic_metadata=semantic_metadata,
     )
     args.report_file.parent.mkdir(parents=True, exist_ok=True)
